@@ -54,10 +54,11 @@ interface ProcessRequest {
   mostRecentDateCol: string;
   includeNegative: boolean;
   recipientMode: 'l1' | 'l2' | 'both';
+  actionMode: 'both' | 'sharepoint' | 'email';
 }
 
 export async function POST(req: Request) {
-  const { rowHeaders, rowData, reportDate, mostRecentDateCol, includeNegative, recipientMode } =
+  const { rowHeaders, rowData, reportDate, mostRecentDateCol, includeNegative, recipientMode, actionMode = 'both' } =
     await req.json() as ProcessRequest;
 
   // Reconstruct rows from compact array format (~400KB vs full JSON objects)
@@ -121,6 +122,9 @@ export async function POST(req: Request) {
 
     const storeResults: StoreResult[] = await Promise.all(
       storeInfos.map(async ({ storeName, storeRows, l2Name, l1Name, fileName, buffer }) => {
+        if (actionMode === 'email') {
+          return { storeName, l2Name, l1Name, rowCount: storeRows.length, webUrl: '', fileName } as StoreResult;
+        }
         try {
           const { webUrl } = await uploadReport(buffer, l1Name, reportDate, fileName);
           return { storeName, l2Name, l1Name, rowCount: storeRows.length, webUrl, fileName } as StoreResult;
@@ -144,8 +148,9 @@ export async function POST(req: Request) {
     // Group results by L1 (for L1 emails)
     const byL1 = new Map<string, { repInfo: { l1Email: string; l2Name: string }; stores: StoreResult[] }[]>();
 
-    // 5. Send emails via after() to avoid Vercel timeout on slow SMTP
+    // 5. Send emails via after() (skipped if actionMode is 'sharepoint')
     after(async () => {
+      if (actionMode === 'sharepoint') return;
       const emailErrors: string[] = [];
 
       // ── Level 2 emails: ONE PER STORE ─────────────────────────────────────

@@ -54,6 +54,7 @@ export default function Home() {
   const [isFetchingControl, setIsFetchingControl] = useState(false);
   const [includeNegative, setIncludeNegative] = useState(false);
   const [recipientMode, setRecipientMode] = useState<'l1' | 'l2' | 'both'>('both');
+  const [actionMode, setActionMode] = useState<'both' | 'sharepoint' | 'email'>('both');
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -141,6 +142,7 @@ export default function Home() {
           mostRecentDateCol: parseResult.mostRecentDateCol ?? '',
           includeNegative,
           recipientMode,
+          actionMode,
         }),
       });
 
@@ -286,7 +288,20 @@ export default function Home() {
             </label>
 
             <div>
-              <p className="text-foreground text-sm mb-2 font-medium">Send reports to:</p>
+              <p className="text-foreground text-sm mb-2 font-medium">Action:</p>
+              <select
+                value={actionMode}
+                onChange={(e) => setActionMode(e.target.value as 'both' | 'sharepoint' | 'email')}
+                className="bg-background border border-border rounded-lg px-3 py-2 text-foreground text-sm"
+              >
+                <option value="both">Email &amp; Save to SharePoint</option>
+                <option value="sharepoint">Save to SharePoint only</option>
+                <option value="email">Email only</option>
+              </select>
+            </div>
+
+            <div className={actionMode === 'sharepoint' ? 'opacity-40 pointer-events-none' : ''}>
+              <p className="text-foreground text-sm mb-2 font-medium">Send emails to:</p>
               <div className="flex gap-6">
                 {(['l1', 'l2', 'both'] as const).map((mode) => (
                   <label key={mode} className="flex items-center gap-2 cursor-pointer">
@@ -367,7 +382,7 @@ export default function Home() {
                 onMouseEnter={(e) => { if (!e.currentTarget.disabled) e.currentTarget.style.background = '#ea6c0a'; }}
                 onMouseLeave={(e) => { if (!e.currentTarget.disabled) e.currentTarget.style.background = '#f97316'; }}
               >
-                {stage === 'processing' ? 'Processing...' : 'Process & Send Reports'}
+                {stage === 'processing' ? 'Processing...' : actionMode === 'sharepoint' ? 'Upload to SharePoint Only' : actionMode === 'email' ? 'Send Emails Only' : 'Process & Send Reports'}
               </button>
             )}
 
@@ -399,7 +414,7 @@ export default function Home() {
                 </div>
 
                 <div className="text-success text-sm">
-                  &#10003; Reports saved to iRAM SharePoint. Emails dispatched in background.
+                  &#10003; {actionMode === 'sharepoint' ? 'Reports saved to iRAM SharePoint.' : actionMode === 'email' ? 'Emails dispatched in background.' : 'Reports saved to iRAM SharePoint. Emails dispatched in background.'}
                 </div>
 
                 {processSummary.errors.length > 0 && (
