@@ -73,8 +73,11 @@ export default function Home() {
       for (const f of fileArr) fd.append('files', f);
 
       const res = await fetch('/api/parse', { method: 'POST', body: fd });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Parse error ${res.status}: ${text.slice(0, 300)}`);
+      }
       const data = await res.json();
-      if (!res.ok) throw new Error((data as { error?: string }).error ?? 'Parse failed');
 
       setParseResult(data as ParseResponse);
       setUploadedFiles(fileArr);
@@ -140,8 +143,11 @@ export default function Home() {
         body: fd,
       });
 
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Server error ${res.status}: ${text.slice(0, 300)}`);
+      }
       const data = await res.json();
-      if (!res.ok) throw new Error((data as { error?: string }).error ?? 'Processing failed');
 
       setProcessSummary((data as { summary: ProcessSummary }).summary);
       setStage('done');
