@@ -2,7 +2,6 @@ import { NextResponse, after } from 'next/server';
 import { buildStoreReport, sanitizeFilename } from '@/lib/report-builder';
 import { uploadReport } from '@/lib/graph-iram';
 import { sendEmail } from '@/lib/graph-oj';
-import { parseExcelBuffer } from '@/lib/excel-parser';
 import {
   buildL2StoreEmail,
   buildL1RepEmail,
@@ -17,6 +16,15 @@ import type {
 
 export const maxDuration = 60;
 
+interface ProcessRequest {
+  rows: RawRow[];
+  controlMap: ControlMap;
+  reportDate: string;
+  mostRecentDateCol: string;
+  includeNegative: boolean;
+  recipientMode: 'l1' | 'l2' | 'both';
+}
+
 function isPhantom(row: RawRow, includeNegative: boolean): boolean {
   const val = row.Phantom_Indicator.trim().toUpperCase();
   if (val === 'TRUE') return true;
@@ -25,22 +33,8 @@ function isPhantom(row: RawRow, includeNegative: boolean): boolean {
 }
 
 export async function POST(req: Request) {
-  const formData = await req.formData();
-
-  const files = formData.getAll('files') as File[];
-  const controlMap = JSON.parse(formData.get('controlMap') as string) as ControlMap;
-  const reportDate = formData.get('reportDate') as string;
-  const mostRecentDateCol = formData.get('mostRecentDateCol') as string;
-  const includeNegative = formData.get('includeNegative') === 'true';
-  const recipientMode = formData.get('recipientMode') as 'l1' | 'l2' | 'both';
-
-  // Re-parse files server-side (avoids sending large JSON body from client)
-  const rows: RawRow[] = [];
-  for (const file of files) {
-    const buffer = Buffer.from(await file.arrayBuffer());
-    const parsed = parseExcelBuffer(buffer, file.name);
-    rows.push(...parsed.rows);
-  }
+  const { rows, controlMap, reportDate, mostRecentDateCol, includeNegative, recipientMode } =
+    await req.json() as ProcessRequest;
 
   // Return an early acknowledgement and do heavy work in after()
   // But for simplicity + Vercel timeout handling we keep a streaming approach —

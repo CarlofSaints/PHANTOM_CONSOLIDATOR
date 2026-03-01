@@ -25,6 +25,13 @@ export async function POST(req: Request) {
     const allRows = results.flatMap((r) => r.rows);
     const allDateCols = [...new Set(results.flatMap((r) => r.dateColumns))].sort();
 
+    // Only keep phantom rows (TRUE or NEGATIVE) — discards the bulk of non-phantom data
+    // Process route will apply the includeNegative filter at send time
+    const phantomRows = allRows.filter((r) => {
+      const val = r.Phantom_Indicator.trim().toUpperCase();
+      return val === 'TRUE' || val === 'NEGATIVE';
+    });
+
     return NextResponse.json({
       files: results.map((r) => ({
         fileName: r.fileName,
@@ -33,9 +40,10 @@ export async function POST(req: Request) {
         dateColumns: r.dateColumns,
       })),
       totalRows: allRows.length,
+      phantomCount: phantomRows.length,
       allDateColumns: allDateCols,
       mostRecentDateCol: allDateCols.length > 0 ? allDateCols[allDateCols.length - 1] : null,
-      rows: allRows,
+      rows: phantomRows,
     });
   } catch (e) {
     console.error('[parse]', e);
