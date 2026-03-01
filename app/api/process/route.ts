@@ -103,48 +103,34 @@ export async function POST(req: Request) {
 
     summary.stores = storeMap.size;
 
-    // 3. Process each store: build XLSX, upload to iRAM
-    const storeResults: StoreResult[] = [];
+    // 3. Process each store: build XLSX buffers (sync), then upload all in parallel
     const storeBuffers = new Map<string, Buffer>(); // storeName → xlsx buffer
 
-    for (const [storeName, storeRows] of storeMap.entries()) {
+    const storeInfos = Array.from(storeMap.entries()).map(([storeName, storeRows]) => {
       const firstRow = storeRows[0];
       const l2Name = firstRow.Personnel_Level_2 || 'Unknown Rep';
       const repInfo = controlMap[l2Name];
       const l1Name = repInfo?.l1Name || 'Unknown Manager';
-
       const safeStore = sanitizeFilename(storeName);
       const safeL2 = sanitizeFilename(l2Name);
       const fileName = `${safeStore}_${safeL2}_${reportDate}.xlsx`;
+      const buffer = buildStoreReport(storeRows, mostRecentDateCol);
+      storeBuffers.set(storeName, buffer);
+      return { storeName, storeRows, l2Name, l1Name, fileName, buffer };
+    });
 
-      try {
-        const buffer = buildStoreReport(storeRows, mostRecentDateCol);
-        storeBuffers.set(storeName, buffer);
-
-        const { webUrl } = await uploadReport(buffer, l1Name, reportDate, fileName);
-
-        storeResults.push({
-          storeName,
-          l2Name,
-          l1Name,
-          rowCount: storeRows.length,
-          webUrl,
-          fileName,
-        });
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        summary.errors.push(`Upload failed for ${storeName}: ${msg}`);
-        storeResults.push({
-          storeName,
-          l2Name,
-          l1Name,
-          rowCount: storeRows.length,
-          webUrl: '',
-          fileName,
-          error: msg,
-        });
-      }
-    }
+    const storeResults: StoreResult[] = await Promise.all(
+      storeInfos.map(async ({ storeName, storeRows, l2Name, l1Name, fileName, buffer }) => {
+        try {
+          const { webUrl } = await uploadReport(buffer, l1Name, reportDate, fileName);
+          return { storeName, l2Name, l1Name, rowCount: storeRows.length, webUrl, fileName } as StoreResult;
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          summary.errors.push(`Upload failed for ${storeName}: ${msg}`);
+          return { storeName, l2Name, l1Name, rowCount: storeRows.length, webUrl: '', fileName, error: msg } as StoreResult;
+        }
+      })
+    );
 
     summary.storeResults = storeResults;
 
