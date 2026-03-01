@@ -42,6 +42,7 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 export default function Home() {
   const [stage, setStage] = useState<Stage>('idle');
   const [parseResult, setParseResult] = useState<ParseResponse | null>(null);
+  const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
   const [controlMap, setControlMap] = useState<ControlMap | null>(null);
   const [controlError, setControlError] = useState<string | null>(null);
   const [processSummary, setProcessSummary] = useState<ProcessSummary | null>(null);
@@ -74,6 +75,7 @@ export default function Home() {
       if (!res.ok) throw new Error((data as { error?: string }).error ?? 'Parse failed');
 
       setParseResult(data as ParseResponse);
+      setUploadedFiles(fileArr);
       setStage('parsed');
 
       // Fetch control file
@@ -116,25 +118,25 @@ export default function Home() {
   // ── Process ──────────────────────────────────────────────────────────────
 
   const handleProcess = async () => {
-    if (!parseResult || !controlMap) return;
+    if (!parseResult || !controlMap || uploadedFiles.length === 0) return;
 
     setStage('processing');
     setErrorMsg(null);
 
     try {
+      const fd = new FormData();
+      for (const f of uploadedFiles) fd.append('files', f);
+      fd.append('controlMap', JSON.stringify(controlMap));
+      fd.append('reportDate', parseResult.mostRecentDateCol
+        ? parseResult.mostRecentDateCol.replace(/\//g, '-')
+        : new Date().toISOString().split('T')[0]);
+      fd.append('mostRecentDateCol', parseResult.mostRecentDateCol ?? '');
+      fd.append('includeNegative', String(includeNegative));
+      fd.append('recipientMode', recipientMode);
+
       const res = await fetch('/api/process', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          rows: parseResult.rows,
-          controlMap,
-          reportDate: parseResult.mostRecentDateCol
-            ? parseResult.mostRecentDateCol.replace(/\//g, '-')
-            : new Date().toISOString().split('T')[0],
-          mostRecentDateCol: parseResult.mostRecentDateCol ?? '',
-          includeNegative,
-          recipientMode,
-        }),
+        body: fd,
       });
 
       const data = await res.json();
@@ -449,6 +451,7 @@ export default function Home() {
                   onClick={() => {
                     setStage('idle');
                     setParseResult(null);
+                    setUploadedFiles([]);
                     setControlMap(null);
                     setControlError(null);
                     setProcessSummary(null);

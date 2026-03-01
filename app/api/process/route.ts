@@ -2,6 +2,7 @@ import { NextResponse, after } from 'next/server';
 import { buildStoreReport, sanitizeFilename } from '@/lib/report-builder';
 import { uploadReport } from '@/lib/graph-iram';
 import { sendEmail } from '@/lib/graph-oj';
+import { parseExcelBuffer } from '@/lib/excel-parser';
 import {
   buildL2StoreEmail,
   buildL1RepEmail,
@@ -14,14 +15,7 @@ import type {
   StoreResult,
 } from '@/types';
 
-interface ProcessRequest {
-  rows: RawRow[];
-  controlMap: ControlMap;
-  reportDate: string;
-  mostRecentDateCol: string;
-  includeNegative: boolean;
-  recipientMode: 'l1' | 'l2' | 'both';
-}
+export const maxDuration = 60;
 
 function isPhantom(row: RawRow, includeNegative: boolean): boolean {
   const val = row.Phantom_Indicator.trim().toUpperCase();
@@ -31,21 +25,22 @@ function isPhantom(row: RawRow, includeNegative: boolean): boolean {
 }
 
 export async function POST(req: Request) {
-  let parsed: ProcessRequest;
-  try {
-    parsed = await req.json() as ProcessRequest;
-  } catch {
-    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
-  }
+  const formData = await req.formData();
 
-  const {
-    rows,
-    controlMap,
-    reportDate,
-    mostRecentDateCol,
-    includeNegative,
-    recipientMode,
-  } = parsed;
+  const files = formData.getAll('files') as File[];
+  const controlMap = JSON.parse(formData.get('controlMap') as string) as ControlMap;
+  const reportDate = formData.get('reportDate') as string;
+  const mostRecentDateCol = formData.get('mostRecentDateCol') as string;
+  const includeNegative = formData.get('includeNegative') === 'true';
+  const recipientMode = formData.get('recipientMode') as 'l1' | 'l2' | 'both';
+
+  // Re-parse files server-side (avoids sending large JSON body from client)
+  const rows: RawRow[] = [];
+  for (const file of files) {
+    const buffer = Buffer.from(await file.arrayBuffer());
+    const parsed = parseExcelBuffer(buffer, file.name);
+    rows.push(...parsed.rows);
+  }
 
   // Return an early acknowledgement and do heavy work in after()
   // But for simplicity + Vercel timeout handling we keep a streaming approach —
