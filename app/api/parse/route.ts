@@ -1,8 +1,15 @@
 import { NextResponse } from 'next/server';
 import { parseExcelBuffer } from '@/lib/excel-parser';
-import type { ParsedFile } from '@/types';
 
 export const maxDuration = 60;
+
+// Fields needed by the process route — sent once as headers, not repeated per row
+const NEEDED_FIELDS = [
+  'CLIENT', 'Product_Principle', 'Sub_Channel', 'SiteCode', 'Store_Name',
+  'Store_Status', 'Product_Brand', 'Product_Sub_Category', 'Channel_ArticleCode',
+  'Client_Product_ID', 'Product_Description', 'Product_Status', 'Range_Indicator',
+  'Personnel_Level_1', 'Personnel_Level_2', 'Phantom_Indicator',
+];
 
 export async function POST(req: Request) {
   try {
@@ -13,7 +20,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'No files provided' }, { status: 400 });
     }
 
-    const results: ParsedFile[] = [];
+    const results = [];
 
     for (const file of files) {
       const buffer = Buffer.from(await file.arrayBuffer());
@@ -21,16 +28,25 @@ export async function POST(req: Request) {
       results.push(parsed);
     }
 
-    // Combine all rows and merge date columns across all files
     const allRows = results.flatMap((r) => r.rows);
     const allDateCols = [...new Set(results.flatMap((r) => r.dateColumns))].sort();
+    const mostRecentDateCol = allDateCols.length > 0 ? allDateCols[allDateCols.length - 1] : null;
 
-    // Only keep phantom rows (TRUE or NEGATIVE) — discards the bulk of non-phantom data
-    // Process route will apply the includeNegative filter at send time
+    // Filter to phantom rows only
     const phantomRows = allRows.filter((r) => {
       const val = r.Phantom_Indicator.trim().toUpperCase();
       return val === 'TRUE' || val === 'NEGATIVE';
     });
+
+    // Compact array format: field names sent once, rows as value arrays only
+    // This roughly halves payload size vs sending full JSON objects
+    const rowHeaders = mostRecentDateCol
+      ? [...NEEDED_FIELDS, mostRecentDateCol]
+      : NEEDED_FIELDS;
+
+    const rowData = phantomRows.map((row) =>
+      rowHeaders.map((h) => row[h] ?? '')
+    );
 
     return NextResponse.json({
       files: results.map((r) => ({
@@ -42,8 +58,9 @@ export async function POST(req: Request) {
       totalRows: allRows.length,
       phantomCount: phantomRows.length,
       allDateColumns: allDateCols,
-      mostRecentDateCol: allDateCols.length > 0 ? allDateCols[allDateCols.length - 1] : null,
-      rows: phantomRows,
+      mostRecentDateCol,
+      rowHeaders,
+      rowData,
     });
   } catch (e) {
     console.error('[parse]', e);

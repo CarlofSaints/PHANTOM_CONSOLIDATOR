@@ -1,15 +1,17 @@
 import { NextResponse, after } from 'next/server';
 import { buildStoreReport, sanitizeFilename } from '@/lib/report-builder';
 import { uploadReport } from '@/lib/graph-iram';
-import { sendEmail } from '@/lib/graph-oj';
+import { sendEmail, readControlFileBuffer } from '@/lib/graph-oj';
 import {
   buildL2StoreEmail,
   buildL1RepEmail,
   buildL1SummaryEmail,
 } from '@/lib/email-builder';
+import * as XLSX from 'xlsx';
 import type {
   RawRow,
   ControlMap,
+  RepInfo,
   ProcessSummary,
   StoreResult,
 } from '@/types';
@@ -17,8 +19,8 @@ import type {
 export const maxDuration = 60;
 
 interface ProcessRequest {
-  rows: RawRow[];
-  controlMap: ControlMap;
+  rowHeaders: string[];
+  rowData: string[][];
   reportDate: string;
   mostRecentDateCol: string;
   includeNegative: boolean;
@@ -32,9 +34,40 @@ function isPhantom(row: RawRow, includeNegative: boolean): boolean {
   return false;
 }
 
+async function fetchControlMap(): Promise<ControlMap> {
+  const buffer = await readControlFileBuffer();
+  const workbook = XLSX.read(buffer, { type: 'buffer' });
+  const ws = workbook.Sheets[workbook.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { defval: '' }) as Record<string, string>[];
+
+  const controlMap: ControlMap = {};
+  for (const row of rows) {
+    let l1Name = '', l2Name = '', l1Email = '', l2Email = '';
+    for (const [k, v] of Object.entries(row)) {
+      const nk = k.trim().toLowerCase();
+      if (nk === 'personnel_level_1' || nk === 'personnel level 1') l1Name = String(v).trim();
+      if (nk === 'personnel_level_2' || nk === 'personnel level 2') l2Name = String(v).trim();
+      if (nk.includes('level_1') && nk.includes('email')) l1Email = String(v).trim();
+      if (nk.includes('level_2') && nk.includes('email')) l2Email = String(v).trim();
+    }
+    if (l2Name) controlMap[l2Name] = { l1Name, l1Email, l2Email } as RepInfo;
+  }
+  return controlMap;
+}
+
 export async function POST(req: Request) {
-  const { rows, controlMap, reportDate, mostRecentDateCol, includeNegative, recipientMode } =
+  const { rowHeaders, rowData, reportDate, mostRecentDateCol, includeNegative, recipientMode } =
     await req.json() as ProcessRequest;
+
+  // Reconstruct RawRow objects from compact array format
+  const rows: RawRow[] = rowData.map((values) => {
+    const row: Record<string, string> = {};
+    rowHeaders.forEach((h, i) => { row[h] = values[i] ?? ''; });
+    return row as RawRow;
+  });
+
+  // Fetch controlMap directly from SharePoint (not sent from client)
+  const controlMap = await fetchControlMap();
 
   // Return an early acknowledgement and do heavy work in after()
   // But for simplicity + Vercel timeout handling we keep a streaming approach —

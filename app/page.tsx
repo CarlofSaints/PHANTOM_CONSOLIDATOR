@@ -1,16 +1,18 @@
 'use client';
 
 import { useState, useRef, useCallback } from 'react';
-import type { RawRow, ControlMap, ProcessSummary } from '@/types';
+import type { ControlMap, ProcessSummary } from '@/types';
 
 // ── Types for client-side state ──────────────────────────────────────────────
 
 interface ParseResponse {
   files: { fileName: string; clientName: string; rowCount: number; dateColumns: string[] }[];
   totalRows: number;
+  phantomCount: number;
   allDateColumns: string[];
   mostRecentDateCol: string | null;
-  rows: RawRow[];
+  rowHeaders: string[];
+  rowData: string[][];
 }
 
 type Stage = 'idle' | 'parsed' | 'processing' | 'done' | 'error';
@@ -128,8 +130,8 @@ export default function Home() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          rows: parseResult.rows, // already phantom-only from parse step
-          controlMap,
+          rowHeaders: parseResult.rowHeaders,
+          rowData: parseResult.rowData,
           reportDate: parseResult.mostRecentDateCol
             ? parseResult.mostRecentDateCol.replace(/\//g, '-')
             : new Date().toISOString().split('T')[0],
@@ -152,12 +154,16 @@ export default function Home() {
 
   // ── Derived data for preview ──────────────────────────────────────────────
 
-  const uniqueStores = parseResult
-    ? new Set(parseResult.rows.map((r) => r.Store_Name)).size
+  // Derive store + rep info from compact rowData
+  const storeNameIdx = parseResult?.rowHeaders.indexOf('Store_Name') ?? -1;
+  const l2Idx = parseResult?.rowHeaders.indexOf('Personnel_Level_2') ?? -1;
+
+  const uniqueStores = parseResult && storeNameIdx >= 0
+    ? new Set(parseResult.rowData.map((r) => r[storeNameIdx])).size
     : 0;
 
-  const uniqueL2s = parseResult
-    ? new Set(parseResult.rows.map((r) => r.Personnel_Level_2).filter(Boolean))
+  const uniqueL2s = parseResult && l2Idx >= 0
+    ? new Set(parseResult.rowData.map((r) => r[l2Idx]).filter(Boolean))
     : new Set<string>();
 
   const missingReps = controlMap && parseResult
@@ -300,7 +306,7 @@ export default function Home() {
         {stage === 'parsed' && parseResult && (
           <Section title="3 — Preview">
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
-              <Badge label="Total Rows" value={parseResult.totalRows.toLocaleString()} />
+              <Badge label="Phantom Rows" value={parseResult.phantomCount.toLocaleString()} />
               <Badge label="Unique Stores" value={uniqueStores} />
               <Badge label="L2 Reps" value={uniqueL2s.size} />
               <Badge label="Report Date" value={reportDate} />
