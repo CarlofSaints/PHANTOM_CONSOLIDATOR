@@ -129,18 +129,19 @@ export default function Home() {
     setErrorMsg(null);
 
     try {
-      const fd = new FormData();
-      for (const f of uploadedFiles) fd.append('files', f);
-      fd.append('reportDate', parseResult.mostRecentDateCol
-        ? parseResult.mostRecentDateCol.replace(/\//g, '-')
-        : new Date().toISOString().split('T')[0]);
-      fd.append('mostRecentDateCol', parseResult.mostRecentDateCol ?? '');
-      fd.append('includeNegative', String(includeNegative));
-      fd.append('recipientMode', recipientMode);
-
       const res = await fetch('/api/process', {
         method: 'POST',
-        body: fd,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          rowHeaders: parseResult.rowHeaders,
+          rowData: parseResult.rowData,
+          reportDate: parseResult.mostRecentDateCol
+            ? parseResult.mostRecentDateCol.replace(/\//g, '-')
+            : new Date().toISOString().split('T')[0],
+          mostRecentDateCol: parseResult.mostRecentDateCol ?? '',
+          includeNegative,
+          recipientMode,
+        }),
       });
 
       if (!res.ok) {

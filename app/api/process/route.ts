@@ -17,6 +17,7 @@ import type {
 } from '@/types';
 
 export const maxDuration = 60;
+export const runtime = 'nodejs';
 
 function isPhantom(row: RawRow, includeNegative: boolean): boolean {
   const val = row.Phantom_Indicator.trim().toUpperCase();
@@ -46,24 +47,27 @@ async function fetchControlMap(): Promise<ControlMap> {
   return controlMap;
 }
 
+interface ProcessRequest {
+  rowHeaders: string[];
+  rowData: string[][];
+  reportDate: string;
+  mostRecentDateCol: string;
+  includeNegative: boolean;
+  recipientMode: 'l1' | 'l2' | 'both';
+}
+
 export async function POST(req: Request) {
-  const formData = await req.formData();
-  const files = formData.getAll('files') as File[];
-  const reportDate = formData.get('reportDate') as string;
-  const mostRecentDateCol = formData.get('mostRecentDateCol') as string;
-  const includeNegative = formData.get('includeNegative') === 'true';
-  const recipientMode = formData.get('recipientMode') as 'l1' | 'l2' | 'both';
+  const { rowHeaders, rowData, reportDate, mostRecentDateCol, includeNegative, recipientMode } =
+    await req.json() as ProcessRequest;
 
-  // Parse files server-side — no row data passes through the client
-  const rows: RawRow[] = [];
-  for (const file of files) {
-    const buffer = Buffer.from(await file.arrayBuffer());
-    const { parseExcelBuffer } = await import('@/lib/excel-parser');
-    const parsed = parseExcelBuffer(buffer, file.name);
-    rows.push(...parsed.rows);
-  }
+  // Reconstruct rows from compact array format (~400KB vs full JSON objects)
+  const rows: RawRow[] = rowData.map((values) => {
+    const row: Record<string, string> = {};
+    rowHeaders.forEach((h, i) => { row[h] = values[i] ?? ''; });
+    return row as RawRow;
+  });
 
-  // Fetch controlMap directly from SharePoint
+  // Fetch controlMap directly from SharePoint — not sent from client
   const controlMap = await fetchControlMap();
 
   // Return an early acknowledgement and do heavy work in after()
