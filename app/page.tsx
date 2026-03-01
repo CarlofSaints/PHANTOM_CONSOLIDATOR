@@ -312,7 +312,7 @@ export default function Home() {
         {stage === 'parsed' && parseResult && (
           <Section title="3 — Preview">
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
-              <Badge label="Phantom Rows" value={parseResult.phantomCount.toLocaleString()} />
+              <Badge label="Phantom Rows ✓" value={parseResult.phantomCount.toLocaleString()} />
               <Badge label="Unique Stores" value={uniqueStores} />
               <Badge label="L2 Reps" value={uniqueL2s.size} />
               <Badge label="Report Date" value={reportDate} />
