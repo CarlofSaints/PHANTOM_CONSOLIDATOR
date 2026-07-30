@@ -3,13 +3,15 @@ import { parseExcelBuffer } from '@/lib/excel-parser';
 
 export const maxDuration = 60;
 
-// Fields needed by the process route — sent once as headers, not repeated per row
+// Fields sent in compact row format (header names sent once, not repeated per row)
 const NEEDED_FIELDS = [
-  'CLIENT', 'Product_Principle', 'Sub_Channel', 'SiteCode', 'Store_Name',
+  'CLIENT', 'Product_Principle', 'Channel', 'Sub_Channel', 'SiteCode', 'Store_Name',
   'Store_Status', 'Product_Brand', 'Product_Sub_Category', 'Channel_ArticleCode',
   'Client_Product_ID', 'Product_Description', 'Product_Status', 'Range_Indicator',
-  'Personnel_Level_1', 'Personnel_Level_2', 'Phantom_Indicator',
+  'Personnel_Level_1', 'Personnel_Level_2', 'Phantom_Indicator', 'Province',
 ];
+
+const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5 MB
 
 export async function POST(req: Request) {
   try {
@@ -20,16 +22,37 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'No files provided' }, { status: 400 });
     }
 
-    const results = [];
+    // ── Per-file size check ───────────────────────────────────────────────────
+    const tooLarge = files.filter((f) => f.size > MAX_FILE_SIZE);
+    if (tooLarge.length > 0) {
+      return NextResponse.json(
+        { error: `File(s) exceed 5 MB limit: ${tooLarge.map((f) => f.name).join(', ')}. Remove all FALSE phantom rows and reload.` },
+        { status: 400 }
+      );
+    }
 
+    const results = [];
     for (const file of files) {
       const buffer = Buffer.from(await file.arrayBuffer());
       const parsed = parseExcelBuffer(buffer, file.name);
       results.push(parsed);
     }
 
+    // ── Duplicate-data detection via fingerprint ──────────────────────────────
+    const fingerprintMap = new Map<string, string>(); // fingerprint → first fileName
+    const duplicateOf: Record<string, string | null> = {};
+    for (const r of results) {
+      if (fingerprintMap.has(r.fingerprint)) {
+        duplicateOf[r.fileName] = fingerprintMap.get(r.fingerprint)!;
+      } else {
+        fingerprintMap.set(r.fingerprint, r.fileName);
+        duplicateOf[r.fileName] = null;
+      }
+    }
+
     const allRows = results.flatMap((r) => r.rows);
     const allDateCols = [...new Set(results.flatMap((r) => r.dateColumns))].sort();
+    const allChannelCols = [...new Set(results.flatMap((r) => r.channels))].sort();
     const mostRecentDateCol = allDateCols.length > 0 ? allDateCols[allDateCols.length - 1] : null;
 
     // Filter to phantom rows only
@@ -38,8 +61,7 @@ export async function POST(req: Request) {
       return val === 'TRUE' || val === 'NEGATIVE';
     });
 
-    // Compact array format: field names sent once, rows as value arrays only
-    // This roughly halves payload size vs sending full JSON objects
+    // Compact row format
     const rowHeaders = mostRecentDateCol
       ? [...NEEDED_FIELDS, mostRecentDateCol]
       : NEEDED_FIELDS;
@@ -54,10 +76,16 @@ export async function POST(req: Request) {
         clientName: r.clientName,
         rowCount: r.rows.length,
         dateColumns: r.dateColumns,
+        provinces: r.provinces,
+        channels: r.channels,
+        missingFields: r.missingFields,
+        duplicateOf: duplicateOf[r.fileName] ?? null,
+        fingerprint: r.fingerprint,
       })),
       totalRows: allRows.length,
       phantomCount: phantomRows.length,
       allDateColumns: allDateCols,
+      allChannels: allChannelCols,
       mostRecentDateCol,
       rowHeaders,
       rowData,

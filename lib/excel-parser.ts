@@ -93,8 +93,8 @@ export function parseExcelBuffer(buffer: Buffer, fileName: string): ParsedFile {
       Channel: get('Channel'),
       Sub_Channel: get('Sub_Channel'),
       Province: get('Province'),
-      Personnel_Level_1: get('Personnel_Level_1'),
-      Personnel_Level_2: get('Personnel_Level_2'),
+      Personnel_Level_1: get('Personnel_Level_1').replace(/\s+\S+@\S+\.\S+$/, '').trim(),
+      Personnel_Level_2: get('Personnel_Level_2').replace(/\s+\S+@\S+\.\S+$/, '').trim(),
       SiteCode: get('SiteCode'),
       Store_Name: get('Store_Name'),
       Store_Status: get('Store_Status'),
@@ -121,5 +121,24 @@ export function parseExcelBuffer(buffer: Buffer, fileName: string): ParsedFile {
     rows.find((r) => r.CLIENT)?.CLIENT ??
     fileName.replace(/\.[^.]+$/, '');
 
-  return { fileName, clientName, rows, dateColumns };
+  // Unique province values
+  const provinces = [...new Set(rows.map((r) => r.Province).filter(Boolean))].sort() as string[];
+
+  // Unique channel values
+  const channels = [...new Set(rows.map((r) => r.Channel).filter(Boolean))].sort() as string[];
+
+  // Required fields that were not found in the header row
+  const REQUIRED_FIELDS = [
+    'Personnel_Level_1', 'Personnel_Level_2', 'Store_Name',
+    'SiteCode', 'Phantom_Indicator', 'Province',
+  ];
+  const missingFields = REQUIRED_FIELDS.filter((f) => (colIdx[f] ?? -1) === -1);
+
+  // Fingerprint: row count + first 10 sorted unique store names
+  const sortedStores = [...new Set(rows.map((r) => r.Store_Name).filter(Boolean))]
+    .sort()
+    .slice(0, 10);
+  const fingerprint = `${rows.length}|${sortedStores.join(',')}`;
+
+  return { fileName, clientName, rows, dateColumns, provinces, channels, missingFields, fingerprint };
 }

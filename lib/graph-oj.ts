@@ -9,8 +9,12 @@ const CLIENT_SECRET = process.env.OJ_CLIENT_SECRET!;
 const SP_HOST = process.env.OJ_SP_HOST ?? 'exceler8xl.sharepoint.com';
 const LIBRARY_NAME = process.env.OJ_SP_LIBRARY ?? 'Clients';
 const CONTROL_FILE_FOLDER = process.env.OJ_CONTROL_FILE_FOLDER ?? '';
-const CONTROL_FILE_NAME = process.env.OJ_CONTROL_FILE_NAME ?? 'email-control.xlsx';
-const EMAIL_FROM = process.env.EMAIL_FROM ?? '';
+const CHANNELS_CONFIG_NAME = 'phantom-channels.json';
+const DEFAULT_CHANNELS = ['PnP', 'Builders Warehouse', 'Makro', 'Game', 'Checkers', 'Dis-Chem', 'Clicks'];
+const EMAIL_FROM = (process.env.OJ_EMAIL_FROM ?? process.env.EMAIL_FROM ?? '')
+  .replace(/\\n|\\r|\n|\r/g, '') // strip literal \n or real newlines (common env var corruption)
+  .trim()
+  .replace(/^["']|["']$/g, ''); // strip accidental surrounding quotes
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -39,9 +43,9 @@ function encodePath(path: string): string {
   return path.split('/').map((seg) => encodeURIComponent(seg)).join('/');
 }
 
-type DriveContext = { token: string; driveId: string };
+export type DriveContext = { token: string; driveId: string };
 
-async function getDriveContext(): Promise<DriveContext> {
+export async function getDriveContext(): Promise<DriveContext> {
   const token = await getToken();
 
   const siteRes = await fetch(
@@ -66,16 +70,61 @@ async function getDriveContext(): Promise<DriveContext> {
 
 // ── Read control file ────────────────────────────────────────────────────────
 
-export async function readControlFileBuffer(): Promise<Buffer> {
-  const { token, driveId } = await getDriveContext();
-  const filePath = encodePath(`${CONTROL_FILE_FOLDER}/${CONTROL_FILE_NAME}`);
+/**
+ * Reads the control file for a specific channel.
+ * File naming convention: "{channelName} - User Control File - Phantom Consolidator.xlsx"
+ * Pass a shared DriveContext to avoid re-authenticating per channel.
+ */
+export async function readControlFileBuffer(channelName: string, ctx?: DriveContext): Promise<Buffer> {
+  const { token, driveId } = ctx ?? await getDriveContext();
+  const fileName = `${channelName} - User Control File - Phantom Consolidator.xlsx`;
+  const filePath = encodePath(CONTROL_FILE_FOLDER ? `${CONTROL_FILE_FOLDER}/${fileName}` : fileName);
   const res = await fetch(
     `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${filePath}:/content`,
     { headers: { Authorization: `Bearer ${token}` } }
   );
-  if (!res.ok) throw new Error(`OJ: could not read control file: ${await res.text()}`);
+  if (!res.ok) throw new Error(`OJ: could not read control file for "${channelName}": ${await res.text()}`);
   const ab = await res.arrayBuffer();
   return Buffer.from(ab);
+}
+
+// ── Channel config (phantom-channels.json on OJ SP) ──────────────────────────
+
+export async function readChannelsConfig(ctx?: DriveContext): Promise<string[]> {
+  try {
+    const { token, driveId } = ctx ?? await getDriveContext();
+    const filePath = encodePath(
+      CONTROL_FILE_FOLDER ? `${CONTROL_FILE_FOLDER}/${CHANNELS_CONFIG_NAME}` : CHANNELS_CONFIG_NAME
+    );
+    const res = await fetch(
+      `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${filePath}:/content`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!res.ok) return [...DEFAULT_CHANNELS];
+    const data = await res.json() as { channels?: string[] };
+    return Array.isArray(data.channels) && data.channels.length > 0 ? data.channels : [...DEFAULT_CHANNELS];
+  } catch {
+    return [...DEFAULT_CHANNELS];
+  }
+}
+
+export async function writeChannelsConfig(channels: string[], ctx?: DriveContext): Promise<void> {
+  const { token, driveId } = ctx ?? await getDriveContext();
+  const filePath = encodePath(
+    CONTROL_FILE_FOLDER ? `${CONTROL_FILE_FOLDER}/${CHANNELS_CONFIG_NAME}` : CHANNELS_CONFIG_NAME
+  );
+  const res = await fetch(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${filePath}:/content`,
+    {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ channels }),
+    }
+  );
+  if (!res.ok) throw new Error(`OJ: could not write channels config: ${await res.text()}`);
 }
 
 // ── Send email via Graph sendMail ────────────────────────────────────────────
@@ -93,6 +142,10 @@ export interface EmailPayload {
 }
 
 export async function sendEmail(payload: EmailPayload): Promise<void> {
+  if (!EMAIL_FROM) {
+    throw new Error('OJ: EMAIL_FROM is not configured — set OJ_EMAIL_FROM in Vercel env vars');
+  }
+  console.log(`[sendEmail] FROM=${EMAIL_FROM} TO=${payload.to} SUBJECT=${payload.subject}`);
   const token = await getToken();
 
   const message: Record<string, unknown> = {

@@ -1,45 +1,38 @@
 import { NextResponse } from 'next/server';
-import { readControlFileBuffer } from '@/lib/graph-oj';
-import * as XLSX from 'xlsx';
-import type { ControlMap, RepInfo } from '@/types';
+import { getDriveContext, readControlFileBuffer } from '@/lib/graph-oj';
+import { parseControlBuffer } from '@/lib/parse-control-file';
+import type { ControlMap } from '@/types';
 
-export async function GET() {
+export async function GET(req: Request) {
   try {
-    const buffer = await readControlFileBuffer();
-    const workbook = XLSX.read(buffer, { type: 'buffer' });
-    const ws = workbook.Sheets[workbook.SheetNames[0]];
-    const rows = XLSX.utils.sheet_to_json(ws, { defval: '' }) as Record<string, string>[];
+    const url = new URL(req.url);
+    const channelsParam = url.searchParams.get('channels') ?? '';
+    const channels = channelsParam.split(',').map((s) => s.trim()).filter(Boolean);
 
-    // Expected headers (case-insensitive):
-    // Personnel_Level_1 | Personnel_Level_2 | Personnel_Level_1 - EMAIL | Personnel_Level_2 - EMAIL
+    if (channels.length === 0) {
+      return NextResponse.json({ controlMap: {} });
+    }
+
+    // Fetch a shared drive context (one auth call) then read all channel files in parallel
+    const ctx = await getDriveContext();
+    const results = await Promise.allSettled(
+      channels.map((ch) => readControlFileBuffer(ch, ctx))
+    );
 
     const controlMap: ControlMap = {};
+    const errors: string[] = [];
 
-    for (const row of rows) {
-      // Normalise keys
-      const norm = (k: string) => k.trim().toLowerCase();
-      const entries = Object.entries(row);
-
-      let l1Name = '';
-      let l2Name = '';
-      let l1Email = '';
-      let l2Email = '';
-
-      for (const [k, v] of entries) {
-        const nk = norm(k);
-        if (nk === 'personnel_level_1' || nk === 'personnel level 1') l1Name = String(v).trim();
-        if (nk === 'personnel_level_2' || nk === 'personnel level 2') l2Name = String(v).trim();
-        if (nk === 'personnel_level_1 - email' || nk === 'personnel level 1 - email' || nk === 'personnel_level_1 email') l1Email = String(v).trim();
-        if (nk === 'personnel_level_2 - email' || nk === 'personnel level 2 - email' || nk === 'personnel_level_2 email') l2Email = String(v).trim();
-      }
-
-      if (l2Name) {
-        const info: RepInfo = { l1Name, l1Email, l2Email };
-        controlMap[l2Name] = info;
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      const channelName = channels[i];
+      if (result.status === 'rejected') {
+        errors.push(`"${channelName}": ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`);
+      } else {
+        parseControlBuffer(result.value, controlMap);
       }
     }
 
-    return NextResponse.json({ controlMap });
+    return NextResponse.json({ controlMap, errors });
   } catch (e) {
     console.error('[control-file]', e);
     const msg = e instanceof Error ? e.message : 'Failed to load control file';

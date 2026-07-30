@@ -30,6 +30,10 @@ export interface ParsedFile {
   clientName: string;
   rows: RawRow[];
   dateColumns: string[];
+  provinces: string[];      // unique province values found in this file
+  channels: string[];       // unique Channel values found in this file
+  missingFields: string[];  // required fields whose header wasn't found
+  fingerprint: string;      // for duplicate-data detection
 }
 
 // ── Control file lookup ─────────────────────────────────────────────────────

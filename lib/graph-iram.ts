@@ -3,6 +3,8 @@
  * Used for: creating folders and uploading per-store XLSX reports
  */
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 const TENANT_ID = process.env.IRAM_TENANT_ID!;
 const CLIENT_ID = process.env.IRAM_CLIENT_ID!;
 const CLIENT_SECRET = process.env.IRAM_CLIENT_SECRET!;
@@ -37,9 +39,9 @@ function encodePath(path: string): string {
   return path.split('/').map((seg) => encodeURIComponent(seg)).join('/');
 }
 
-type DriveContext = { token: string; driveId: string };
+export type DriveContext = { token: string; driveId: string };
 
-async function getDriveContext(): Promise<DriveContext> {
+export async function getDriveContext(): Promise<DriveContext> {
   const token = await getToken();
 
   const siteRes = await fetch(
@@ -99,7 +101,7 @@ async function ensureFolderExists(
   }
 }
 
-// ── Upload file ──────────────────────────────────────────────────────────────
+// ── Upload file (with 429 retry + shared context) ────────────────────────────
 
 export interface UploadResult {
   webUrl: string;
@@ -110,34 +112,50 @@ export async function uploadReport(
   buffer: Buffer,
   l1Name: string,
   reportDate: string,
-  fileName: string
+  fileName: string,
+  channel: string,       // channel folder layer, e.g. "PnP"
+  ctx?: DriveContext     // pass a shared context to avoid re-fetching token/driveId per store
 ): Promise<UploadResult> {
-  const { token, driveId } = await getDriveContext();
+  const { token, driveId } = ctx ?? await getDriveContext();
 
-  const folderPath = `${BASE_FOLDER}/${l1Name}/${reportDate}`;
+  const folderPath = `${BASE_FOLDER}/${channel}/${l1Name}/${reportDate}`;
   await ensureFolderExists(token, driveId, folderPath);
 
   const filePath = encodePath(`${folderPath}/${fileName}`);
 
-  const uploadRes = await fetch(
-    `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${filePath}:/content`,
-    {
-      method: 'PUT',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      },
-      body: new Uint8Array(buffer),
-    }
-  );
+  // Retry up to 3 times on 429 throttle, respecting Retry-After (capped at 30s)
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const uploadRes = await fetch(
+      `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${filePath}:/content`,
+      {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        },
+        body: new Uint8Array(buffer),
+      }
+    );
 
-  if (!uploadRes.ok) {
-    throw new Error(`iRAM: upload failed (${uploadRes.status}): ${await uploadRes.text()}`);
+    if (uploadRes.status === 429) {
+      if (attempt === 3) {
+        throw new Error(`iRAM: upload failed (429): throttled after 3 retries`);
+      }
+      const retryAfterSec = parseInt(uploadRes.headers.get('Retry-After') ?? '15', 10);
+      await sleep(Math.min(retryAfterSec, 30) * 1000);
+      continue;
+    }
+
+    if (!uploadRes.ok) {
+      throw new Error(`iRAM: upload failed (${uploadRes.status}): ${await uploadRes.text()}`);
+    }
+
+    const uploaded = await uploadRes.json();
+    return {
+      webUrl: uploaded.webUrl as string,
+      fileId: uploaded.id as string,
+    };
   }
 
-  const uploaded = await uploadRes.json();
-  return {
-    webUrl: uploaded.webUrl as string,
-    fileId: uploaded.id as string,
-  };
+  throw new Error('iRAM: upload failed — max retries exceeded');
 }

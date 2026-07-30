@@ -1,23 +1,24 @@
 import { NextResponse, after } from 'next/server';
 import { buildStoreReport, sanitizeFilename } from '@/lib/report-builder';
-import { uploadReport } from '@/lib/graph-iram';
-import { sendEmail, readControlFileBuffer } from '@/lib/graph-oj';
+import { uploadReport, getDriveContext } from '@/lib/graph-iram';
+import { sendEmail, getDriveContext as getOjDriveContext, readControlFileBuffer } from '@/lib/graph-oj';
+import { parseControlBuffer } from '@/lib/parse-control-file';
 import {
   buildL2StoreEmail,
   buildL1RepEmail,
   buildL1SummaryEmail,
 } from '@/lib/email-builder';
-import * as XLSX from 'xlsx';
 import type {
   RawRow,
   ControlMap,
-  RepInfo,
   ProcessSummary,
   StoreResult,
 } from '@/types';
 
-export const maxDuration = 60;
+export const maxDuration = 300;
 export const runtime = 'nodejs';
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 function isPhantom(row: RawRow, includeNegative: boolean): boolean {
   const val = row.Phantom_Indicator.trim().toUpperCase();
@@ -26,23 +27,20 @@ function isPhantom(row: RawRow, includeNegative: boolean): boolean {
   return false;
 }
 
-async function fetchControlMap(): Promise<ControlMap> {
-  const buffer = await readControlFileBuffer();
-  const workbook = XLSX.read(buffer, { type: 'buffer' });
-  const ws = workbook.Sheets[workbook.SheetNames[0]];
-  const xlsxRows = XLSX.utils.sheet_to_json(ws, { defval: '' }) as Record<string, string>[];
+async function fetchControlMap(channels: string[]): Promise<ControlMap> {
+  const ctx = await getOjDriveContext();
+  const results = await Promise.allSettled(
+    channels.map((ch) => readControlFileBuffer(ch, ctx))
+  );
 
   const controlMap: ControlMap = {};
-  for (const row of xlsxRows) {
-    let l1Name = '', l2Name = '', l1Email = '', l2Email = '';
-    for (const [k, v] of Object.entries(row)) {
-      const nk = k.trim().toLowerCase();
-      if (nk === 'personnel_level_1' || nk === 'personnel level 1') l1Name = String(v).trim();
-      if (nk === 'personnel_level_2' || nk === 'personnel level 2') l2Name = String(v).trim();
-      if (nk.includes('level_1') && nk.includes('email')) l1Email = String(v).trim();
-      if (nk.includes('level_2') && nk.includes('email')) l2Email = String(v).trim();
+  for (let i = 0; i < results.length; i++) {
+    const result = results[i];
+    if (result.status === 'rejected') {
+      console.warn(`[process] Could not load control file for channel "${channels[i]}":`, result.reason);
+    } else {
+      parseControlBuffer(result.value, controlMap);
     }
-    if (l2Name) controlMap[l2Name] = { l1Name, l1Email, l2Email } as RepInfo;
   }
   return controlMap;
 }
@@ -55,25 +53,26 @@ interface ProcessRequest {
   includeNegative: boolean;
   recipientMode: 'l1' | 'l2' | 'both';
   actionMode: 'both' | 'sharepoint' | 'email';
+  selectedProvinces?: Record<string, string[]>; // clientName → allowed provinces
+  selectedChannels: string[];                   // channel names for control file + SP folder
 }
 
 export async function POST(req: Request) {
-  const { rowHeaders, rowData, reportDate, mostRecentDateCol, includeNegative, recipientMode, actionMode = 'both' } =
-    await req.json() as ProcessRequest;
+  const {
+    rowHeaders, rowData, reportDate, mostRecentDateCol,
+    includeNegative, recipientMode, actionMode = 'both', selectedProvinces,
+    selectedChannels = [],
+  } = await req.json() as ProcessRequest;
 
-  // Reconstruct rows from compact array format (~400KB vs full JSON objects)
+  // Reconstruct rows from compact array format
   const rows: RawRow[] = rowData.map((values) => {
     const row: Record<string, string> = {};
     rowHeaders.forEach((h, i) => { row[h] = values[i] ?? ''; });
     return row as RawRow;
   });
 
-  // Fetch controlMap directly from SharePoint — not sent from client
-  const controlMap = await fetchControlMap();
-
-  // Return an early acknowledgement and do heavy work in after()
-  // But for simplicity + Vercel timeout handling we keep a streaming approach —
-  // process is synchronous, after() handles any fire-and-forget cleanup.
+  // Fetch controlMap from SharePoint (one file per selected channel, merged)
+  const controlMap = await fetchControlMap(selectedChannels);
 
   const summary: ProcessSummary = {
     stores: 0,
@@ -84,8 +83,15 @@ export async function POST(req: Request) {
   };
 
   try {
-    // 1. Filter rows to phantom only
-    const phantomRows = rows.filter((r) => isPhantom(r, includeNegative));
+    // 1. Filter to phantom rows + province filter
+    const phantomRows = rows.filter((r) => {
+      if (!isPhantom(r, includeNegative)) return false;
+      if (selectedProvinces) {
+        const allowed = selectedProvinces[r.CLIENT];
+        if (allowed && !allowed.includes(r.Province)) return false;
+      }
+      return true;
+    });
 
     if (phantomRows.length === 0) {
       return NextResponse.json({
@@ -104,64 +110,86 @@ export async function POST(req: Request) {
 
     summary.stores = storeMap.size;
 
-    // 3. Process each store: build XLSX buffers (sync), then upload all in parallel
-    const storeBuffers = new Map<string, Buffer>(); // storeName → xlsx buffer
+    // Helper: resolve which channel folder a store's rows belong to.
+    // Match the row's Channel value (case-insensitive) against selectedChannels;
+    // fall back to the first selected channel if no match found.
+    const resolveChannel = (rowChannel: string): string => {
+      const norm = rowChannel.trim().toLowerCase();
+      const match = selectedChannels.find((c) => c.toLowerCase() === norm);
+      return match ?? selectedChannels[0] ?? 'UNKNOWN';
+    };
 
+    // 3. Build XLSX buffers synchronously (no network calls)
+    const storeBuffers = new Map<string, Buffer>();
     const storeInfos = Array.from(storeMap.entries()).map(([storeName, storeRows]) => {
       const firstRow = storeRows[0];
       const l2Name = firstRow.Personnel_Level_2 || 'Unknown Rep';
-      const repInfo = controlMap[l2Name];
+      const repInfo = controlMap[l2Name.toLowerCase()];
       const l1Name = repInfo?.l1Name || 'Unknown Manager';
+      const channel = resolveChannel(firstRow.Channel ?? '');
       const safeStore = sanitizeFilename(storeName);
       const safeL2 = sanitizeFilename(l2Name);
       const fileName = `${safeStore}_${safeL2}_${reportDate}.xlsx`;
       const buffer = buildStoreReport(storeRows, mostRecentDateCol);
       storeBuffers.set(storeName, buffer);
-      return { storeName, storeRows, l2Name, l1Name, fileName, buffer };
+      return { storeName, storeRows, l2Name, l1Name, channel, fileName, buffer };
     });
 
-    const storeResults: StoreResult[] = await Promise.all(
-      storeInfos.map(async ({ storeName, storeRows, l2Name, l1Name, fileName, buffer }) => {
-        if (actionMode === 'email') {
-          return { storeName, l2Name, l1Name, rowCount: storeRows.length, webUrl: '', fileName } as StoreResult;
-        }
-        try {
-          const { webUrl } = await uploadReport(buffer, l1Name, reportDate, fileName);
-          return { storeName, l2Name, l1Name, rowCount: storeRows.length, webUrl, fileName } as StoreResult;
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          summary.errors.push(`Upload failed for ${storeName}: ${msg}`);
-          return { storeName, l2Name, l1Name, rowCount: storeRows.length, webUrl: '', fileName, error: msg } as StoreResult;
-        }
-      })
-    );
+    const storeResults: StoreResult[] = storeInfos.map(({ storeName, storeRows, l2Name, l1Name, fileName }) => ({
+      storeName, l2Name, l1Name, rowCount: storeRows.length, webUrl: '', fileName,
+    }));
 
     summary.storeResults = storeResults;
 
-    // 4. Group results by L2 rep
+    // 4. Group by L2
     const byL2 = new Map<string, StoreResult[]>();
     for (const sr of storeResults) {
       if (!byL2.has(sr.l2Name)) byL2.set(sr.l2Name, []);
       byL2.get(sr.l2Name)!.push(sr);
     }
 
-    // Group results by L1 (for L1 emails)
-    const byL1 = new Map<string, { repInfo: { l1Email: string; l2Name: string }; stores: StoreResult[] }[]>();
+    summary.reps = new Set(storeResults.map((r) => r.l2Name)).size;
 
-    // 5. Send emails via after() (skipped if actionMode is 'sharepoint')
+    // ── SP uploads — fire-and-forget in after() ───────────────────────────────
     after(async () => {
-      if (actionMode === 'sharepoint') return;
-      const emailErrors: string[] = [];
+      if (actionMode === 'email') return;
 
-      // ── Level 2 emails: ONE PER STORE ─────────────────────────────────────
+      let ctx;
+      try {
+        ctx = await getDriveContext();
+      } catch (e) {
+        console.error('[process/sp] Failed to get drive context:', e);
+        return;
+      }
+
+      const BATCH_SIZE = 3;
+      for (let i = 0; i < storeInfos.length; i += BATCH_SIZE) {
+        const batch = storeInfos.slice(i, i + BATCH_SIZE);
+        await Promise.all(
+          batch.map(async ({ storeName, l1Name, channel, fileName, buffer }) => {
+            try {
+              await uploadReport(buffer, l1Name, reportDate, fileName, channel, ctx);
+            } catch (e) {
+              console.error(`[process/sp] Upload failed for ${storeName}:`, e);
+            }
+          })
+        );
+        if (i + BATCH_SIZE < storeInfos.length) await sleep(300);
+      }
+    });
+
+    // ── Emails — synchronous so results are visible in the response ───────────
+    if (actionMode !== 'sharepoint') {
+      const byL1 = new Map<string, { repInfo: { l1Email: string; l2Name: string }; stores: StoreResult[] }[]>();
+
+      // L2 emails: one per store
       if (recipientMode === 'l2' || recipientMode === 'both') {
         for (const [storeName, storeRows] of storeMap.entries()) {
-          const firstRow = storeRows[0];
-          const l2Name = firstRow.Personnel_Level_2 || '';
-          const repInfo = controlMap[l2Name];
+          const l2Name = storeRows[0].Personnel_Level_2 || '';
+          const repInfo = controlMap[l2Name.toLowerCase()];
 
           if (!repInfo?.l2Email) {
-            emailErrors.push(`No L2 email for rep "${l2Name}" (store: ${storeName})`);
+            summary.errors.push(`No L2 email for rep "${l2Name}" (store: ${storeName})`);
             continue;
           }
 
@@ -172,91 +200,63 @@ export async function POST(req: Request) {
             await sendEmail({
               to: repInfo.l2Email,
               subject: `Phantom Stock Report – ${storeName} – ${reportDate}`,
-              htmlBody: buildL2StoreEmail(
-                storeName,
-                l2Name,
-                storeRows,
-                reportDate,
-                mostRecentDateCol
-              ),
+              htmlBody: buildL2StoreEmail(storeName, l2Name, storeRows, reportDate, mostRecentDateCol),
               attachments: storeBuffer
-                ? [
-                    {
-                      name: sr?.fileName ?? `${sanitizeFilename(storeName)}_${reportDate}.xlsx`,
-                      contentBytes: storeBuffer.toString('base64'),
-                    },
-                  ]
+                ? [{ name: sr?.fileName ?? `${sanitizeFilename(storeName)}_${reportDate}.xlsx`, contentBytes: storeBuffer.toString('base64') }]
                 : [],
             });
+            summary.emailsSent++;
           } catch (e) {
-            emailErrors.push(
-              `L2 email failed for ${storeName} to ${repInfo.l2Email}: ${e instanceof Error ? e.message : String(e)}`
-            );
+            const msg = e instanceof Error ? e.message : String(e);
+            summary.errors.push(`L2 email failed for ${storeName} → ${repInfo.l2Email}: ${msg}`);
           }
         }
       }
 
-      // ── Level 1 emails: ONE PER L2 (covering that L2's stores) ───────────
+      // L1 emails: one per L2 rep
       if (recipientMode === 'l1' || recipientMode === 'both') {
         for (const [l2Name, l2Stores] of byL2.entries()) {
-          const repInfo = controlMap[l2Name];
+          const repInfo = controlMap[l2Name.toLowerCase()];
           if (!repInfo?.l1Email) {
-            emailErrors.push(`No L1 email for L1 of rep "${l2Name}"`);
+            summary.errors.push(`No L1 email for manager of "${l2Name}"`);
             continue;
           }
 
-          // Build attachments for all this L2's stores
           const attachments = l2Stores
             .map((sr) => {
               const buf = storeBuffers.get(sr.storeName);
-              return buf
-                ? { name: sr.fileName, contentBytes: buf.toString('base64') }
-                : null;
+              return buf ? { name: sr.fileName, contentBytes: buf.toString('base64') } : null;
             })
             .filter((a): a is { name: string; contentBytes: string } => a !== null);
-
-          const l1Name = repInfo.l1Name || 'Manager';
 
           try {
             await sendEmail({
               to: repInfo.l1Email,
               subject: `Phantom Reports for ${l2Name} – ${reportDate}`,
               htmlBody: buildL1RepEmail(
-                l1Name,
-                {
-                  l2Name,
-                  stores: l2Stores.map((s) => ({
-                    storeName: s.storeName,
-                    rowCount: s.rowCount,
-                  })),
-                },
+                repInfo.l1Name || 'Manager',
+                { l2Name, stores: l2Stores.map((s) => ({ storeName: s.storeName, rowCount: s.rowCount })) },
                 reportDate
               ),
               attachments,
             });
+            summary.emailsSent++;
 
-            // Track for summary email
             if (!byL1.has(repInfo.l1Email)) byL1.set(repInfo.l1Email, []);
-            byL1.get(repInfo.l1Email)!.push({
-              repInfo: { l1Email: repInfo.l1Email, l2Name },
-              stores: l2Stores,
-            });
+            byL1.get(repInfo.l1Email)!.push({ repInfo: { l1Email: repInfo.l1Email, l2Name }, stores: l2Stores });
           } catch (e) {
-            emailErrors.push(
-              `L1 email failed for ${l2Name} to ${repInfo.l1Email}: ${e instanceof Error ? e.message : String(e)}`
-            );
+            const msg = e instanceof Error ? e.message : String(e);
+            summary.errors.push(`L1 email failed for "${l2Name}" → ${repInfo.l1Email}: ${msg}`);
           }
         }
 
-        // ── Level 1 SUMMARY email: one per unique L1 ──────────────────────
+        // L1 summary email: one per unique L1
         for (const [l1Email, l2Groups] of byL1.entries()) {
-          const l1Name =
-            controlMap[l2Groups[0].repInfo.l2Name]?.l1Name || 'Manager';
-
+          const l1Name = controlMap[l2Groups[0].repInfo.l2Name.toLowerCase()]?.l1Name || 'Manager';
           const summaryRows = l2Groups.map((g) => ({
             l2Name: g.repInfo.l2Name,
             storeCount: g.stores.length,
-            reportsSent: g.stores.filter((s) => !s.error).length,
+            reportsSent: g.stores.length,
           }));
 
           try {
@@ -265,21 +265,14 @@ export async function POST(req: Request) {
               subject: `Phantom Report Summary – ${reportDate}`,
               htmlBody: buildL1SummaryEmail(l1Name, summaryRows, reportDate),
             });
+            summary.emailsSent++;
           } catch (e) {
-            emailErrors.push(
-              `L1 summary email failed to ${l1Email}: ${e instanceof Error ? e.message : String(e)}`
-            );
+            const msg = e instanceof Error ? e.message : String(e);
+            summary.errors.push(`L1 summary email failed → ${l1Email}: ${msg}`);
           }
         }
       }
-
-      if (emailErrors.length > 0) {
-        console.error('[process] Email errors:', emailErrors);
-      }
-    });
-
-    const uniqueReps = new Set(storeResults.map((r) => r.l2Name)).size;
-    summary.reps = uniqueReps;
+    }
 
     return NextResponse.json({ success: true, summary });
   } catch (e) {
